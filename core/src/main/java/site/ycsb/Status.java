@@ -86,11 +86,12 @@ public class Status {
   }
 
   /**
-   * Is {@code this} a passing state for the operation: {@link Status#OK} or {@link Status#BATCHED_OK}.
+   * Is {@code this} a passing state for the operation: {@link Status#OK}, {@link Status#BATCHED_OK} or
+   * {@link Status#PENDING}.
    * @return true if the operation is successful, false otherwise
    */
   public boolean isOk() {
-    return this == OK || this == BATCHED_OK;
+    return this == OK || this == BATCHED_OK || this == PENDING;
   }
 
   public static final Status OK = new Status("OK", "The operation completed successfully.");
@@ -106,5 +107,11 @@ public class Status {
       "service for the current binding is not available.");
   public static final Status BATCHED_OK = new Status("BATCHED_OK", "The operation has been batched by " +
       "the binding to be executed later.");
+  /**
+   * The operation was issued asynchronously (open-loop). {@link DBWrapper} does not measure it; the binding
+   * reports latency and status itself when the operation completes.
+   */
+  public static final Status PENDING = new Status("PENDING", "The operation has been issued asynchronously; " +
+      "the binding reports its result on completion.");
 }
 

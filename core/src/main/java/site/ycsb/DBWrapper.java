@@ -123,6 +123,11 @@ public class DBWrapper extends DB {
     }
   }
 
+  @Override
+  public void drain() throws DBException {
+    db.drain();
+  }
+
   /**
    * Read a record from the database. Each field/value pair from the result
    * will be stored in a HashMap.
@@ -140,8 +145,10 @@ public class DBWrapper extends DB {
       long st = System.nanoTime();
       Status res = db.read(table, key, fields, result);
       long en = System.nanoTime();
-      measure("READ", res, ist, st, en);
-      measurements.reportStatus("READ", res);
+      if (res != Status.PENDING) {
+        measure("READ", res, ist, st, en);
+        measurements.reportStatus("READ", res);
+      }
       return res;
     }
   }
@@ -164,8 +171,10 @@ public class DBWrapper extends DB {
       long st = System.nanoTime();
       Status res = db.scan(table, startkey, recordcount, fields, result);
       long en = System.nanoTime();
-      measure("SCAN", res, ist, st, en);
-      measurements.reportStatus("SCAN", res);
+      if (res != Status.PENDING) {
+        measure("SCAN", res, ist, st, en);
+        measurements.reportStatus("SCAN", res);
+      }
       return res;
     }
   }
@@ -203,8 +212,10 @@ public class DBWrapper extends DB {
       long st = System.nanoTime();
       Status res = db.update(table, key, values);
       long en = System.nanoTime();
-      measure("UPDATE", res, ist, st, en);
-      measurements.reportStatus("UPDATE", res);
+      if (res != Status.PENDING) {
+        measure("UPDATE", res, ist, st, en);
+        measurements.reportStatus("UPDATE", res);
+      }
       return res;
     }
   }
@@ -226,8 +237,10 @@ public class DBWrapper extends DB {
       long st = System.nanoTime();
       Status res = db.insert(table, key, values);
       long en = System.nanoTime();
-      measure("INSERT", res, ist, st, en);
-      measurements.reportStatus("INSERT", res);
+      if (res != Status.PENDING) {
+        measure("INSERT", res, ist, st, en);
+        measurements.reportStatus("INSERT", res);
+      }
       return res;
     }
   }
@@ -245,8 +258,10 @@ public class DBWrapper extends DB {
       long st = System.nanoTime();
       Status res = db.delete(table, key);
       long en = System.nanoTime();
-      measure("DELETE", res, ist, st, en);
-      measurements.reportStatus("DELETE", res);
+      if (res != Status.PENDING) {
+        measure("DELETE", res, ist, st, en);
+        measurements.reportStatus("DELETE", res);
+      }
       return res;
     }
   }

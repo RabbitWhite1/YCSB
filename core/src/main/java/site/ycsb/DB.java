@@ -78,6 +78,14 @@ public abstract class DB {
   }
 
   /**
+   * Wait until every operation this instance has issued has completed and been measured.
+   * Bindings that return {@link Status#PENDING} must override this; the rate sweep calls it
+   * between stages so that no request of one stage is measured in the next.
+   */
+  public void drain() throws DBException {
+  }
+
+  /**
    * Read a record from the database. Each field/value pair from the result will be stored in a HashMap.
    *
    * @param table The name of the table

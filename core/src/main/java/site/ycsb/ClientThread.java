@@ -44,6 +44,7 @@ public class ClientThread implements Runnable {
   private Properties props;
   private long targetOpsTickNs;
   private final Measurements measurements;
+  private RateSweep sweep;
 
   /**
    * Constructor.
@@ -81,6 +82,15 @@ public class ClientThread implements Runnable {
     threadcount = threadCount;
   }
 
+  /** Run the transaction phase as the stages of {@code rateSweep} instead of one opcount/target. */
+  void setRateSweep(final RateSweep rateSweep) {
+    sweep = rateSweep;
+    opcount = 0;
+    for (int s = 0; s < rateSweep.stages(); s++) {
+      opcount += rateSweep.threadOps(threadid, threadcount);
+    }
+  }
+
   public int getOpsDone() {
     return opsdone;
   }
@@ -114,7 +124,9 @@ public class ClientThread implements Runnable {
       sleepUntil(System.nanoTime() + randomMinorDelay);
     }
     try {
-      if (dotransactions) {
+      if (sweep != null) {
+        runSweep();
+      } else if (dotransactions) {
         long startTimeNanos = System.nanoTime();
 
         while (((opcount == 0) || (opsdone < opcount)) && !workload.isStopRequested()) {
@@ -155,6 +167,33 @@ public class ClientThread implements Runnable {
       e.printStackTrace(System.out);
     } finally {
       completeLatch.countDown();
+    }
+  }
+
+  private void runSweep() throws Exception {
+    int stageOps = sweep.threadOps(threadid, threadcount);
+    sweep.await(); // all threads start stage 0 together
+    for (int s = 0; s < sweep.stages(); s++) {
+      double perThreadPerMs = sweep.rate(s) / (double) threadcount / 1000.0;
+      long tickNs = (long) (1000000 / perThreadPerMs);
+      long startTimeNanos = sweep.stageStartNs();
+      // Spread the threads over one tick so they don't all fire at the stage start.
+      if (perThreadPerMs <= 1.0) {
+        startTimeNanos += ThreadLocalRandom.current().nextLong(tickNs);
+        sleepUntil(startTimeNanos);
+      }
+      for (int i = 1; i <= stageOps && !workload.isStopRequested(); i++) {
+        measurements.setIntendedStartTimeNs(startTimeNanos + (i - 1) * tickNs);
+        if (!workload.doTransaction(db, workloadstate)) {
+          break;
+        }
+        opsdone++;
+        long deadline = startTimeNanos + i * tickNs;
+        sleepUntil(deadline);
+      }
+      measurements.setIntendedStartTimeNs(0);
+      db.drain();
+      sweep.await();
     }
   }
 

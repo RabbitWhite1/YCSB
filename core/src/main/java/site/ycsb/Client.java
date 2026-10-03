@@ -26,6 +26,7 @@ import org.apache.htrace.core.Tracer;
 
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.*;
@@ -213,16 +214,44 @@ public final class Client {
    */
   private static void exportMeasurements(Properties props, int opcount, long runtime)
       throws IOException {
+    // if no destination file is provided the results will be written to stdout
+    OutputStream out;
+    String exportFile = props.getProperty(EXPORT_FILE_PROPERTY);
+    if (exportFile == null) {
+      out = System.out;
+    } else {
+      out = new FileOutputStream(exportFile);
+    }
+    exportMeasurements(props, out, opcount, runtime);
+  }
+
+  /**
+   * Exports one rate-sweep stage, framed by "[RATESWEEP], BEGIN, rate" and "[RATESWEEP], END, rate" lines
+   * on stdout. With an export file, the stage goes to "exportfile.rate" instead.
+   */
+  private static void exportStage(Properties props, int rate, long opcount, long runtime) throws IOException {
+    String exportFile = props.getProperty(EXPORT_FILE_PROPERTY);
+    System.out.println("[RATESWEEP], BEGIN, " + rate);
+    System.out.flush();
+    if (exportFile == null) {
+      // Keep stdout open for the next stages.
+      exportMeasurements(props, new FilterOutputStream(System.out) {
+          @Override
+          public void close() throws IOException {
+            flush();
+          }
+        }, opcount, runtime);
+    } else {
+      exportMeasurements(props, new FileOutputStream(exportFile + "." + rate), opcount, runtime);
+    }
+    System.out.println("[RATESWEEP], END, " + rate);
+    System.out.flush();
+  }
+
+  private static void exportMeasurements(Properties props, OutputStream out, long opcount, long runtime)
+      throws IOException {
     MeasurementsExporter exporter = null;
     try {
-      // if no destination file is provided the results will be written to stdout
-      OutputStream out;
-      String exportFile = props.getProperty(EXPORT_FILE_PROPERTY);
-      if (exportFile == null) {
-        out = System.out;
-      } else {
-        out = new FileOutputStream(exportFile);
-      }
 
       // if no exporter is provided the default text one will be used
       String exporterStr = props.getProperty(EXPORTER_PROPERTY,
@@ -273,6 +302,43 @@ public final class Client {
     }
   }
 
+  /**
+   * Sets the measurement properties; for a rate sweep (returned rates non-null), those of its first stage.
+   */
+  private static int[] setUpMeasurements(Properties props, int target) {
+    int[] sweepRates = RateSweep.parseRates(props);
+    if (sweepRates == null) {
+      Measurements.setProperties(props);
+      return null;
+    }
+    if (!Boolean.valueOf(props.getProperty(DO_TRANSACTIONS_PROPERTY, String.valueOf(true)))) {
+      System.err.println(RateSweep.RATES_PROPERTY + " only applies to the transaction phase (-t).");
+      System.exit(1);
+    }
+    // Bindings that require a target (e.g. zookeeper.async) see the first stage's rate.
+    if (target <= 0) {
+      props.setProperty(TARGET_PROPERTY, String.valueOf(sweepRates[0]));
+    }
+    Measurements.setProperties(RateSweep.stageProps(props, sweepRates[0]));
+    return sweepRates;
+  }
+
+  private static void attachRateSweep(Properties props, int[] sweepRates, List<ClientThread> clients) {
+    int stageOps = Integer.parseInt(props.getProperty(RateSweep.OPERATION_COUNT_PROPERTY,
+        props.getProperty(OPERATION_COUNT_PROPERTY, "0")));
+    if (stageOps <= 0) {
+      System.err.println(RateSweep.RATES_PROPERTY + " needs " + RateSweep.OPERATION_COUNT_PROPERTY
+          + " (or " + OPERATION_COUNT_PROPERTY + ") > 0: the operations of each stage.");
+      System.exit(1);
+    }
+    RateSweep sweep = new RateSweep(sweepRates, stageOps, props, clients.size(),
+        clients.toArray(new ClientThread[0]),
+        (stage, rate, ops, runtimeMs) -> exportStage(props, rate, ops, runtimeMs));
+    for (ClientThread client : clients) {
+      client.setRateSweep(sweep);
+    }
+  }
+
   @SuppressWarnings("unchecked")
   public static void main(String[] args) {
     Properties props = parseArguments(args);
@@ -297,7 +363,7 @@ public final class Client {
     Thread warningthread = setupWarningThread();
     warningthread.start();
 
-    Measurements.setProperties(props);
+    final int[] sweepRates = setUpMeasurements(props, target);
 
     Workload workload = getWorkload(props);
 
@@ -310,6 +376,9 @@ public final class Client {
 
     final List<ClientThread> clients = initDb(dbname, props, threadcount, targetperthreadperms,
         workload, tracer, completeLatch);
+    if (sweepRates != null) {
+      attachRateSweep(props, sweepRates, clients);
+    }
 
     if (status) {
       boolean standardstatus = false;
@@ -389,7 +458,10 @@ public final class Client {
 
     try {
       try (final TraceScope span = tracer.newScope(CLIENT_EXPORT_MEASUREMENTS_SPAN)) {
-        exportMeasurements(props, opsDone, en - st);
+        // A rate sweep has exported every stage already; what is left is only CLEANUP.
+        if (sweepRates == null) {
+          exportMeasurements(props, opsDone, en - st);
+        }
       }
     } catch (IOException e) {
       System.err.println("Could not export measurements, error: " + e.getMessage());

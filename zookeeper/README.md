@@ -46,6 +46,39 @@ Set connectString, sessionTimeout, watchFlag in the workload you plan to run.
       ./bin/ycsb run zookeeper -s -P workloads/workloadb -p zookeeper.connectString=127.0.0.1:2181/benchmark -p zookeeper.watchFlag=true
       ```
 
+- `zookeeper.async`
+  * Open-loop mode (default false). Each client thread issues requests at its share of `-target` using ZooKeeper's
+    async API and never waits for responses, so the offered load stays at `-target` even when the servers fall behind.
+    Latency is measured when each response arrives; use `-p measurement.interval=intended` (or `both`) to measure from
+    the scheduled send time. Requires `-target`; `readmodifywriteproportion` and `dataintegrity` are not supported,
+    and read results are not returned to the workload.
+- `zookeeper.async.connectTimeoutMs`
+  * In open-loop mode, each thread waits for its session to connect and then for every thread's session to connect
+    before issuing (default: 300000). The schedules therefore start together once all sessions are up.
+- `zookeeper.async.drainTimeoutMs`
+  * In open-loop mode, how long each thread waits at the end of the run for in-flight requests (default: 600000, i.e.
+    10 minutes). Requests still in flight after that fail with ConnectionLoss when the session closes. Sessions are
+    closed only after every thread has drained (or this timeout passes), so no request waits behind another thread's
+    session close. `[OVERALL] RunTime`/`Throughput` include this drain; use the per-op `Operations` counts and the run
+    duration for the achieved rate.
+
+      ```bash
+      ./bin/ycsb run zookeeper -threads 8 -target 20000 -P workloads/workloada -p zookeeper.connectString=127.0.0.1:2181/benchmark -p zookeeper.async=true -p measurement.interval=intended -p operationcount=0 -p maxexecutiontime=60
+      ```
+
+- `ratesweep` (core YCSB, any binding; for open loop combine with `zookeeper.async=true`)
+  * Comma-separated target rates, e.g. `10000,15000,20000`. Replaces `-target`: the run phase becomes one stage per
+    rate, all in one process with the same sessions. Each stage runs `ratesweep.operationcount` operations (default:
+    `operationcount`). After a stage every thread drains its in-flight requests, all threads meet at a barrier, the
+    stage's summary is printed between `[RATESWEEP], BEGIN, <rate>` and `[RATESWEEP], END, <rate>`, measurements are
+    reset, and the client waits `ratesweep.settle.ms` (default 5000) before the next stage starts on all threads at
+    once. With `measurement.raw.output_file=F` each stage's raw per-op data goes to `F.<rate>`; with `exportfile=E`
+    each summary goes to `E.<rate>`. The first stage also warms up the JVM; repeat its rate first if that matters.
+
+      ```bash
+      ./bin/ycsb run zookeeper -threads 2000 -P workloads/workloada -p zookeeper.connectString=127.0.0.1:2181 -p zookeeper.async=true -p measurement.interval=intended -p ratesweep=10000,20000,30000 -p ratesweep.operationcount=1000000
+      ```
+
 Or, you can set configs with the shell command, EG:
 
     # create a /benchmark namespace for sake of cleaning up the workspace after test.

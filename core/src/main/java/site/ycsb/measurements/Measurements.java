@@ -66,11 +66,12 @@ public class Measurements {
     return singleton;
   }
 
-  private final ConcurrentHashMap<String, OneMeasurement> opToMesurementMap;
-  private final ConcurrentHashMap<String, OneMeasurement> opToIntendedMesurementMap;
+  // Not final: reset() swaps them for a new rate-sweep stage.
+  private volatile ConcurrentHashMap<String, OneMeasurement> opToMesurementMap;
+  private volatile ConcurrentHashMap<String, OneMeasurement> opToIntendedMesurementMap;
   private final MeasurementType measurementType;
   private final int measurementInterval;
-  private final Properties props;
+  private volatile Properties props;
 
   /**
    * Create a new object with the specified properties.
@@ -247,6 +248,17 @@ public class Measurements {
         getOpIntendedMeasurement(operation) :
         getOpMeasurement(operation);
     m.reportStatus(status);
+  }
+
+  /**
+   * Drop all measurements and start collecting afresh with {@code newProps} (e.g. a new raw output file).
+   * Only safe while no operation is in flight: a rate sweep calls it between stages, after every
+   * client thread has drained.
+   */
+  public synchronized void reset(Properties newProps) {
+    props = newProps;
+    opToMesurementMap = new ConcurrentHashMap<>();
+    opToIntendedMesurementMap = new ConcurrentHashMap<>();
   }
 
   /**
