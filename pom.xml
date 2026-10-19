@@ -151,7 +151,7 @@ LICENSE file.
     <thrift.version>0.8.0</thrift.version>
     <tablestore.version>4.8.0</tablestore.version>
     <voltdb.version>10.1.1</voltdb.version>
-    <zookeeper.version>3.5.8</zookeeper.version>
+    <zookeeper.version>3.10.0-SNAPSHOT</zookeeper.version>
   </properties>
 
   <modules>
