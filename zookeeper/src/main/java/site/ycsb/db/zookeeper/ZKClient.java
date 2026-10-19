@@ -77,6 +77,9 @@ public class ZKClient extends DB {
   private static final long DEFAULT_SESSION_TIMEOUT = TimeUnit.SECONDS.toMillis(30L);
   private static final String WATCH_FLAG = "zookeeper.watchFlag";
   private static final String ASYNC_PROPERTY = "zookeeper.async";
+  // Update with a single setData of the given fields, skipping the getData + merge that YCSB's
+  // "add or replace fields" semantics need. Pair with writeallfields=true to write whole records.
+  private static final String BLIND_UPDATE_PROPERTY = "zookeeper.blindUpdate";
   private static final String DRAIN_TIMEOUT_PROPERTY = "zookeeper.async.drainTimeoutMs";
   private static final long DEFAULT_DRAIN_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(10L);
   // Under overload every in-flight request can fail at once; log a sample, not each one.
@@ -94,6 +97,7 @@ public class ZKClient extends DB {
   // requests in flight would queue those requests behind the closes and inflate the tail.
   private static CountDownLatch allDrained;
   private int threadCount;
+  private boolean blindUpdate;
 
   private static final Charset UTF_8 = Charset.forName("UTF-8");
   private static final Logger LOG = LoggerFactory.getLogger(ZKClient.class);
@@ -120,6 +124,7 @@ public class ZKClient extends DB {
       sessionTimeout = DEFAULT_SESSION_TIMEOUT;
     }
 
+    blindUpdate = Boolean.parseBoolean(props.getProperty(BLIND_UPDATE_PROPERTY, "false"));
     async = Boolean.parseBoolean(props.getProperty(ASYNC_PROPERTY, "false"));
     if (async) {
       if (Integer.parseInt(props.getProperty(Client.TARGET_PROPERTY, "0")) <= 0) {
@@ -293,6 +298,10 @@ public class ZKClient extends DB {
       return Status.PENDING;
     }
     try {
+      if (blindUpdate) {
+        zk.setData(path, getJsonStrFromByteMap(values).getBytes(UTF_8), -1);
+        return Status.OK;
+      }
       // we have to do a read operation here before setData to meet the YCSB's update semantics:
       // update a single record in the database, adding or replacing the specified fields.
       byte[] data = zk.getData(path, watcher, null);
@@ -318,10 +327,16 @@ public class ZKClient extends DB {
   }
 
   /**
-   * Same read-then-setData semantics as the synchronous update, chained through callbacks.
+   * Same read-then-setData semantics as the synchronous update, chained through callbacks
+   * (or a single setData with zookeeper.blindUpdate).
    */
   private void updateAsync(String table, String path, Map<String, String> values) {
     Pending p = new Pending("UPDATE");
+    if (blindUpdate) {
+      zk.setData(path, JSONValue.toJSONString(values).getBytes(UTF_8), -1,
+          (rc, pth, ctx, stat) -> p.complete(toStatus(rc, pth, table, false)), null);
+      return;
+    }
     zk.getData(path, watcher, (rc, pth, ctx, data, stat) -> setDataAfterRead(p, table, values, rc, pth, data), null);
   }
 
