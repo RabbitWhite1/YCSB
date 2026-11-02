@@ -48,6 +48,7 @@ Client settings:
 | `etcd.endpoints` | `localhost:2379` | comma-separated; `host:port` gets `http://` (or `https://` with TLS) |
 | `etcd.dial_timeout` | 2 s | integer **nanoseconds**, as go-ycsb's `GetDuration` parses it; anything else means the default. Used as jetcd's connect timeout. |
 | `etcd.cert_file`, `etcd.key_file`, `etcd.cacert_file` | | required when `etcd.endpoints` contains `https`; the client key must be PKCS#8 PEM (netty) |
+| `etcd.pool_size` | 0 | **not in go-ycsb's etcd binding.** 0 keeps go-ycsb's single client shared by all threads. N > 0 opens N clients, each its own gRPC connection, given to the threads round-robin, like go-ycsb's `redis.pool_size`. N = `threadcount` gives one connection per thread. |
 
 Not identical, by construction:
 - **Client library.** jetcd vs Go's clientv3 v3.5.2. They issue the same gRPC requests, but their retry policies after RPC failures (e.g. a leader change) differ. With no failures, the behaviour is the same.

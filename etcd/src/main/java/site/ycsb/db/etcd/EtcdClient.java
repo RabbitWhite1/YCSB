@@ -29,13 +29,17 @@ import java.io.File;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.Vector;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -64,6 +68,12 @@ public class EtcdClient extends DB {
   /** Open-loop mode (not in go-ycsb): issue each operation without waiting and measure it on completion. */
   public static final String ASYNC = "etcd.async";
   public static final String DRAIN_TIMEOUT = "etcd.async.drainTimeoutMs";
+  /**
+   * Clients (connections) per process, like go-ycsb's redis.pool_size (not in go-ycsb's etcd binding): 0, the
+   * default, shares one client among all threads as go-ycsb's etcd binding does; N > 0 opens N clients, each its own
+   * gRPC connection, and gives them to the threads round-robin (N = threadcount: one connection per thread).
+   */
+  public static final String POOL_SIZE = "etcd.pool_size";
 
   private static final String DEFAULT_ENDPOINTS = "localhost:2379";
   private static final long DEFAULT_DIAL_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(2);
@@ -75,9 +85,12 @@ public class EtcdClient extends DB {
   private static final AtomicLong ERRORS = new AtomicLong();
   private static final Logger LOG = LoggerFactory.getLogger(EtcdClient.class);
 
-  // go-ycsb creates one clientv3.Client for all its threads; YCSB creates one DB per thread, so they share one.
-  private static Client sharedClient;
+  // go-ycsb creates one clientv3.Client for all its threads; YCSB creates one DB per thread, so they share
+  // one (or, with etcd.pool_size, a pool of clients, one per connection).
+  private static List<Client> pool;
   private static int sharedRefs;
+  private static int nextClient;
+  private static ExecutorService poolExecutor;
 
   private KV kv;
   private boolean async;
@@ -109,27 +122,42 @@ public class EtcdClient extends DB {
   }
 
   private static synchronized Client acquireClient(Properties props, boolean warmUp) throws DBException {
-    if (sharedClient == null) {
-      sharedClient = buildClient(props);
+    if (pool == null) {
+      int size = Integer.parseInt(props.getProperty(POOL_SIZE, "0"));
+      List<Client> clients = new ArrayList<>();
+      if (size > 0) {
+        // One callback executor for the whole pool instead of one per client.
+        poolExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "etcd-pool-callback");
+            t.setDaemon(true);
+            return t;
+          });
+      }
+      for (int i = 0; i < Math.max(size, 1); i++) {
+        clients.add(buildClient(props, poolExecutor));
+      }
       if (warmUp) {
         // Async mode only: connect before the open-loop schedule starts, so no measured request waits for
         // the connection. go-ycsb (and the synchronous mode here) connect on the first operation.
-        try {
-          sharedClient.getClusterClient().listMember().get();
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          throw new DBException("Interrupted while connecting.");
-        } catch (ExecutionException e) {
-          throw new DBException("Cannot reach etcd: " + e.getCause());
+        for (Client c : clients) {
+          try {
+            c.getClusterClient().listMember().get();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DBException("Interrupted while connecting.");
+          } catch (ExecutionException e) {
+            throw new DBException("Cannot reach etcd: " + e.getCause());
+          }
         }
       }
+      pool = clients;
     }
     sharedRefs++;
-    return sharedClient;
+    return pool.get(nextClient++ % pool.size());
   }
 
   /** clientv3.Config of go-ycsb's getClientConfig, on jetcd. */
-  static Client buildClient(Properties props) throws DBException {
+  static Client buildClient(Properties props, ExecutorService executor) throws DBException {
     String endpoints = props.getProperty(ENDPOINTS, DEFAULT_ENDPOINTS);
     boolean tls = endpoints.contains("https");
     ClientBuilder b = Client.builder()
@@ -138,6 +166,9 @@ public class EtcdClient extends DB {
         .loadBalancerPolicy("round_robin")
         .waitForReady(true)
         .connectTimeout(Duration.ofNanos(dialTimeoutNs(props.getProperty(DIAL_TIMEOUT))));
+    if (executor != null) {
+      b.executorService(executor);
+    }
     if (tls) {
       // go-ycsb: MustGetString for all three, then transport.TLSInfo{...}.ClientConfig().
       String cert = required(props, CERT_FILE);
@@ -197,8 +228,15 @@ public class EtcdClient extends DB {
     }
     synchronized (EtcdClient.class) {
       if (--sharedRefs == 0) {
-        sharedClient.close();
-        sharedClient = null;
+        for (Client c : pool) {
+          c.close();
+        }
+        pool = null;
+        nextClient = 0;
+        if (poolExecutor != null) {
+          poolExecutor.shutdown();
+          poolExecutor = null;
+        }
       }
     }
   }
