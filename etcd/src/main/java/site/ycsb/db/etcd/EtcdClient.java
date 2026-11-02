@@ -86,7 +86,7 @@ public class EtcdClient extends DB {
   private static final Logger LOG = LoggerFactory.getLogger(EtcdClient.class);
 
   // go-ycsb creates one clientv3.Client for all its threads; YCSB creates one DB per thread, so they share
-  // one (or, with etcd.pool_size, a pool of clients, one per connection).
+  // one (or, with etcd.pool_size, a pool of clients, one per connection), with one callback executor.
   private static List<Client> pool;
   private static int sharedRefs;
   private static int nextClient;
@@ -125,14 +125,14 @@ public class EtcdClient extends DB {
     if (pool == null) {
       int size = Integer.parseInt(props.getProperty(POOL_SIZE, "0"));
       List<Client> clients = new ArrayList<>();
-      if (size > 0) {
-        // One callback executor for the whole pool instead of one per client.
-        poolExecutor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "etcd-pool-callback");
-            t.setDaemon(true);
-            return t;
-          });
-      }
+      // One fixed-size callback executor for all clients. jetcd's default (and a cached pool) grows a thread per
+      // concurrently completing request, thousands under open-loop load, and the client then competes with
+      // itself for the CPUs. Completions are short (decode, measure), so a core's worth of threads keeps up.
+      poolExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), r -> {
+          Thread t = new Thread(r, "etcd-callback");
+          t.setDaemon(true);
+          return t;
+        });
       for (int i = 0; i < Math.max(size, 1); i++) {
         clients.add(buildClient(props, poolExecutor));
       }
