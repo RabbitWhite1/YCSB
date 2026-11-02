@@ -827,7 +827,10 @@ public class CoreWorkload extends Workload {
     long st = System.nanoTime();
     db.scan(table, startkeyname, len, fields, scannedRecords);
     long en = System.nanoTime();
-    measurements.measure("SCAN-LATENCY-PER-RECORD", (int) ((en - st) / 1000 / scannedRecords.size()));
+    // A failed scan returns no records (and is already counted as SCAN-FAILED).
+    if (!scannedRecords.isEmpty()) {
+      measurements.measure("SCAN-LATENCY-PER-RECORD", (int) ((en - st) / 1000 / scannedRecords.size()));
+    }
   }
 
   public void doTransactionUpdate(DB db) {
