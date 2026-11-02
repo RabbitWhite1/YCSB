@@ -1,0 +1,57 @@
+// Generates go-json-vectors.tsv: go run go-json-vectors.go.txt (rename to .go). Go 1.25.1, encoding/json.
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"encoding/base64"
+	"fmt"
+)
+
+func rec() map[string][]byte {
+	m := map[string][]byte{}
+	for i := 0; i < 10; i++ {
+		b := make([]byte, 100)
+		for j := range b {
+			b[j] = byte((i*31 + j*7) % 256)
+		}
+		m[fmt.Sprintf("field%d", i)] = b
+	}
+	return m
+}
+
+func enc(name string, m map[string][]byte) {
+	out, _ := json.Marshal(m)
+	fmt.Printf("ENC\t%s\t%s\n", name, base64.StdEncoding.EncodeToString(out))
+}
+
+func dec(name, in string) {
+	var r map[string][]byte
+	err := json.NewDecoder(bytes.NewReader([]byte(in))).Decode(&r)
+	if err != nil {
+		fmt.Printf("DEC\t%s\t%s\tERROR\n", name, base64.StdEncoding.EncodeToString([]byte(in)))
+		return
+	}
+	out, _ := json.Marshal(r)
+	fmt.Printf("DEC\t%s\t%s\t%s\n", name, base64.StdEncoding.EncodeToString([]byte(in)), base64.StdEncoding.EncodeToString(out))
+}
+
+func main() {
+	enc("record", rec())
+	enc("keys", map[string][]byte{"b": []byte("hi"), "a": []byte("hi"), "é": []byte("hi"), "<k>&": []byte("hi"),
+		"q\"\\": []byte("hi"), "\u2028x\u2029": []byte("hi"), "tab\t\b\f\n\r": []byte("hi"), "\x01\x1f\x7f": []byte("hi"),
+		"Z": []byte("hi"), "𝄞": []byte("hi")})
+	enc("empty", map[string][]byte{})
+	enc("emptyval", map[string][]byte{"x": {}})
+	enc("nilval", map[string][]byte{"x": nil})
+	dec("dupws", " { \"b\" : \"aGk=\" , \"a\":\"aGk=\",\n\"a\":\"bG8=\" } trailing")
+	dec("newline", "{\"x\":\"aG\\nk=\\r\"}")
+	dec("null", "{\"x\":null}")
+	dec("escapedkey", "{\"\\u00e9\\t\\/\":\"aGk=\"}")
+	dec("emptyobj", "{}")
+	dec("array", "[1]")
+	dec("number", "{\"x\":1}")
+	dec("badb64", "{\"x\":\"%%\"}")
+	dec("truncated", "{\"x\":\"aGk=\"")
+	dec("nopad", "{\"x\":\"aGk\"}")
+}
