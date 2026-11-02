@@ -23,8 +23,10 @@ package site.ycsb.db.zookeeper;
 import java.io.IOException;
 import java.nio.charset.Charset;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -98,6 +100,13 @@ public class ZKClient extends DB {
   private static CountDownLatch allDrained;
   private int threadCount;
   private boolean blindUpdate;
+  // zookeeper.pool_size > 0: the process opens that many sessions and its threads share them round-robin
+  // (threads on one session share its FIFO order); 0 (default): every thread has its own session.
+  private static final String POOL_SIZE_PROPERTY = "zookeeper.pool_size";
+  private static List<ZooKeeper> sessionPool;
+  private static int sessionPoolRefs;
+  private static int nextSession;
+  private boolean pooled;
 
   private static final Charset UTF_8 = Charset.forName("UTF-8");
   private static final Logger LOG = LoggerFactory.getLogger(ZKClient.class);
@@ -143,6 +152,18 @@ public class ZKClient extends DB {
       measurements = Measurements.getMeasurements();
     }
 
+    long connectTimeoutMs = Long.parseLong(props.getProperty(CONNECT_TIMEOUT_PROPERTY,
+        String.valueOf(DEFAULT_CONNECT_TIMEOUT_MS)));
+    int poolSize = Integer.parseInt(props.getProperty(POOL_SIZE_PROPERTY, "0"));
+    if (poolSize > 0) {
+      zk = acquireSession(connectString, (int) sessionTimeout, poolSize, connectTimeoutMs);
+      pooled = true;
+      if (async) {
+        awaitAllThreads(props, connectTimeoutMs);
+      }
+      return;
+    }
+
     if (!async) {
       try {
         zk = new ZooKeeper(connectString, (int) sessionTimeout, new SimpleWatcher());
@@ -152,8 +173,6 @@ public class ZKClient extends DB {
       return;
     }
 
-    long connectTimeoutMs = Long.parseLong(props.getProperty(CONNECT_TIMEOUT_PROPERTY,
-        String.valueOf(DEFAULT_CONNECT_TIMEOUT_MS)));
     final CountDownLatch connected = new CountDownLatch(1);
     try {
       zk = new ZooKeeper(connectString, (int) sessionTimeout, e -> {
@@ -164,18 +183,67 @@ public class ZKClient extends DB {
       if (!connected.await(connectTimeoutMs, TimeUnit.MILLISECONDS)) {
         throw new DBException("Session not connected within " + connectTimeoutMs + " ms.");
       }
-      threadCount = Integer.parseInt(props.getProperty(Client.THREAD_COUNT_PROPERTY, "1"));
-      CountDownLatch all = allConnectedLatch(threadCount);
-      all.countDown();
-      if (!all.await(connectTimeoutMs, TimeUnit.MILLISECONDS)) {
-        LOG.warn("{} client threads still not connected after {} ms; starting anyway.", all.getCount(),
-            connectTimeoutMs);
-      }
     } catch (IOException e) {
       throw new DBException("Creating connection failed.");
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       throw new DBException("Interrupted while connecting.");
+    }
+    awaitAllThreads(props, connectTimeoutMs);
+  }
+
+  /** Async mode: wait until every client thread is connected, so the open-loop schedules start together. */
+  private void awaitAllThreads(Properties props, long connectTimeoutMs) throws DBException {
+    threadCount = Integer.parseInt(props.getProperty(Client.THREAD_COUNT_PROPERTY, "1"));
+    CountDownLatch all = allConnectedLatch(threadCount);
+    all.countDown();
+    try {
+      if (!all.await(connectTimeoutMs, TimeUnit.MILLISECONDS)) {
+        LOG.warn("{} client threads still not connected after {} ms; starting anyway.", all.getCount(),
+            connectTimeoutMs);
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new DBException("Interrupted while connecting.");
+    }
+  }
+
+  /** zookeeper.pool_size: the process's shared sessions, opened (and connected) by the first thread. */
+  private static synchronized ZooKeeper acquireSession(String connectString, int sessionTimeout, int size,
+                                                       long connectTimeoutMs) throws DBException {
+    if (sessionPool == null) {
+      List<ZooKeeper> sessions = new ArrayList<>();
+      try {
+        for (int i = 0; i < size; i++) {
+          final CountDownLatch connected = new CountDownLatch(1);
+          sessions.add(new ZooKeeper(connectString, sessionTimeout, e -> {
+              if (e.getState() == Watcher.Event.KeeperState.SyncConnected) {
+                connected.countDown();
+              }
+            }));
+          if (!connected.await(connectTimeoutMs, TimeUnit.MILLISECONDS)) {
+            throw new DBException("Session not connected within " + connectTimeoutMs + " ms.");
+          }
+        }
+      } catch (IOException e) {
+        throw new DBException("Creating connection failed.");
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new DBException("Interrupted while connecting.");
+      }
+      sessionPool = sessions;
+    }
+    sessionPoolRefs++;
+    return sessionPool.get(nextSession++ % sessionPool.size());
+  }
+
+  private static synchronized void releaseSession() throws InterruptedException {
+    if (--sessionPoolRefs == 0) {
+      for (ZooKeeper z : sessionPool) {
+        z.close();
+      }
+      sessionPool = null;
+      nextSession = 0;
     }
   }
 
@@ -203,7 +271,11 @@ public class ZKClient extends DB {
           LOG.warn("{} client threads still draining after {} ms; closing anyway.", all.getCount(), drainTimeoutMs);
         }
       }
-      zk.close();
+      if (pooled) {
+        releaseSession();
+      } else {
+        zk.close();
+      }
     } catch (InterruptedException e) {
       throw new DBException("Closing connection failed.");
     }

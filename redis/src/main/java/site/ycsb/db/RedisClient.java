@@ -84,6 +84,9 @@ public class RedisClient extends DB {
 
   public static final String ASYNC_PROPERTY = "redis.async";
   public static final String DRAIN_TIMEOUT_PROPERTY = "redis.async.drainTimeoutMs";
+  // Async mode, like go-ycsb's redis.pool_size: > 0 opens that many connections per process, shared by the
+  // threads round-robin (Lettuce connections are thread-safe); 0 (default): one connection per thread.
+  public static final String POOL_SIZE_PROPERTY = "redis.pool_size";
   private static final long DEFAULT_DRAIN_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(10L);
   private static final long CONNECT_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(5L);
   private static final long ERROR_LOG_FIRST = 10;
@@ -99,6 +102,10 @@ public class RedisClient extends DB {
   private long drainTimeoutMs;
   private Measurements measurements;
   private StatefulRedisConnection<String, String> connection;
+  private static List<StatefulRedisConnection<String, String>> connectionPool;
+  private static int connectionPoolRefs;
+  private static int nextConnection;
+  private boolean pooled;
   private RedisAsyncCommands<String, String> commands;
   private final AtomicLong outstanding = new AtomicLong();
   private final Object drainLock = new Object();
@@ -167,8 +174,15 @@ public class RedisClient extends DB {
     if (password != null) {
       uri.withPassword(password.toCharArray());
     }
+    int poolSize = Integer.parseInt(props.getProperty(POOL_SIZE_PROPERTY, "0"));
     try {
-      connection = acquireLettuce().connect(uri.build());
+      io.lettuce.core.RedisClient client = acquireLettuce();
+      if (poolSize > 0) {
+        connection = acquirePooled(client, uri.build(), poolSize);
+        pooled = true;
+      } else {
+        connection = client.connect(uri.build());
+      }
     } catch (RuntimeException e) {
       releaseLettuce();
       throw new DBException("Creating connection failed: " + e);
@@ -203,6 +217,29 @@ public class RedisClient extends DB {
     if (--lettuceRefs == 0) {
       lettuce.shutdown();
       lettuce = null;
+    }
+  }
+
+  private static synchronized StatefulRedisConnection<String, String> acquirePooled(
+      io.lettuce.core.RedisClient client, RedisURI uri, int size) {
+    if (connectionPool == null) {
+      List<StatefulRedisConnection<String, String>> pool = new java.util.ArrayList<>();
+      for (int i = 0; i < size; i++) {
+        pool.add(client.connect(uri));
+      }
+      connectionPool = pool;
+    }
+    connectionPoolRefs++;
+    return connectionPool.get(nextConnection++ % connectionPool.size());
+  }
+
+  private static synchronized void releasePooled() {
+    if (--connectionPoolRefs == 0) {
+      for (StatefulRedisConnection<String, String> c : connectionPool) {
+        c.close();
+      }
+      connectionPool = null;
+      nextConnection = 0;
     }
   }
 
@@ -245,7 +282,11 @@ public class RedisClient extends DB {
   public void cleanup() throws DBException {
     if (async) {
       drainOutstanding();
-      connection.close();
+      if (pooled) {
+        releasePooled();
+      } else {
+        connection.close();
+      }
       releaseLettuce();
       return;
     }
