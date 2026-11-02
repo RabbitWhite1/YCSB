@@ -20,15 +20,28 @@
  *
  * All YCSB records are mapped to a Redis *hash field*.  For scanning
  * operations, all keys are saved (by an arbitrary hash) in a sorted set.
+ *
+ * With redis.async=true (open-loop mode, requires -target) the same commands are issued through
+ * Lettuce's asynchronous API on one connection per client thread, and each operation is measured on
+ * completion from its intended start time, like zookeeper.async.
  */
 
 package site.ycsb.db;
 
+import io.lettuce.core.ClientOptions;
+import io.lettuce.core.KeyValue;
+import io.lettuce.core.RedisURI;
+import io.lettuce.core.TimeoutOptions;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.async.RedisAsyncCommands;
 import site.ycsb.ByteIterator;
+import site.ycsb.Client;
 import site.ycsb.DB;
 import site.ycsb.DBException;
 import site.ycsb.Status;
 import site.ycsb.StringByteIterator;
+import site.ycsb.measurements.Measurements;
+import site.ycsb.workloads.CoreWorkload;
 import redis.clients.jedis.BasicCommands;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
@@ -38,6 +51,11 @@ import redis.clients.jedis.Protocol;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.HashSet;
@@ -64,6 +82,27 @@ public class RedisClient extends DB {
 
   public static final String INDEX_KEY = "_indices";
 
+  public static final String ASYNC_PROPERTY = "redis.async";
+  public static final String DRAIN_TIMEOUT_PROPERTY = "redis.async.drainTimeoutMs";
+  private static final long DEFAULT_DRAIN_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(10L);
+  private static final long CONNECT_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(5L);
+  private static final long ERROR_LOG_FIRST = 10;
+  private static final long ERROR_LOG_EVERY = 10000;
+  private static final AtomicLong ASYNC_ERRORS = new AtomicLong();
+
+  // Async mode: one Lettuce client (event loops) per process, one connection per client thread.
+  private static io.lettuce.core.RedisClient lettuce;
+  private static int lettuceRefs;
+  // Every thread waits here until all threads are connected, so the open-loop schedules start together.
+  private static CountDownLatch allConnected;
+  private boolean async;
+  private long drainTimeoutMs;
+  private Measurements measurements;
+  private StatefulRedisConnection<String, String> connection;
+  private RedisAsyncCommands<String, String> commands;
+  private final AtomicLong outstanding = new AtomicLong();
+  private final Object drainLock = new Object();
+
   public void init() throws DBException {
     Properties props = getProperties();
     int port;
@@ -75,6 +114,12 @@ public class RedisClient extends DB {
       port = Protocol.DEFAULT_PORT;
     }
     String host = props.getProperty(HOST_PROPERTY);
+
+    async = Boolean.parseBoolean(props.getProperty(ASYNC_PROPERTY, "false"));
+    if (async) {
+      initAsync(props, host, port);
+      return;
+    }
 
     boolean clusterEnabled = Boolean.parseBoolean(props.getProperty(CLUSTER_PROPERTY));
     if (clusterEnabled) {
@@ -97,7 +142,113 @@ public class RedisClient extends DB {
     }
   }
 
+  private void initAsync(Properties props, String host, int port) throws DBException {
+    if (Integer.parseInt(props.getProperty(Client.TARGET_PROPERTY, "0")) <= 0) {
+      throw new DBException(ASYNC_PROPERTY + " requires -target (otherwise requests are issued unthrottled).");
+    }
+    if (Boolean.parseBoolean(props.getProperty(CLUSTER_PROPERTY))) {
+      throw new DBException(ASYNC_PROPERTY + " does not support " + CLUSTER_PROPERTY + ".");
+    }
+    if (Double.parseDouble(props.getProperty(CoreWorkload.READMODIFYWRITE_PROPORTION_PROPERTY,
+        CoreWorkload.READMODIFYWRITE_PROPORTION_PROPERTY_DEFAULT)) > 0
+        || Double.parseDouble(props.getProperty(CoreWorkload.SCAN_PROPORTION_PROPERTY,
+        CoreWorkload.SCAN_PROPORTION_PROPERTY_DEFAULT)) > 0) {
+      throw new DBException(ASYNC_PROPERTY + " does not support read-modify-write or scan operations.");
+    }
+    if (Boolean.parseBoolean(props.getProperty(CoreWorkload.DATA_INTEGRITY_PROPERTY,
+        CoreWorkload.DATA_INTEGRITY_PROPERTY_DEFAULT))) {
+      throw new DBException(ASYNC_PROPERTY + " does not support dataintegrity=true.");
+    }
+    drainTimeoutMs = Long.parseLong(props.getProperty(DRAIN_TIMEOUT_PROPERTY,
+        String.valueOf(DEFAULT_DRAIN_TIMEOUT_MS)));
+    measurements = Measurements.getMeasurements();
+    RedisURI.Builder uri = RedisURI.builder().withHost(host).withPort(port);
+    String password = props.getProperty(PASSWORD_PROPERTY);
+    if (password != null) {
+      uri.withPassword(password.toCharArray());
+    }
+    try {
+      connection = acquireLettuce().connect(uri.build());
+    } catch (RuntimeException e) {
+      releaseLettuce();
+      throw new DBException("Creating connection failed: " + e);
+    }
+    commands = connection.async();
+    int threads = Integer.parseInt(props.getProperty(Client.THREAD_COUNT_PROPERTY, "1"));
+    CountDownLatch all = allConnectedLatch(threads);
+    all.countDown();
+    try {
+      if (!all.await(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        System.err.println(all.getCount() + " client threads still not connected; starting anyway.");
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new DBException("Interrupted while connecting.");
+    }
+  }
+
+  private static synchronized io.lettuce.core.RedisClient acquireLettuce() {
+    if (lettuce == null) {
+      lettuce = io.lettuce.core.RedisClient.create();
+      // No command timeout: an open-loop run measures every request to its completion.
+      lettuce.setOptions(ClientOptions.builder()
+          .timeoutOptions(TimeoutOptions.builder().timeoutCommands(false).build()).build());
+      lettuce.setDefaultTimeout(Duration.ofDays(1));
+    }
+    lettuceRefs++;
+    return lettuce;
+  }
+
+  private static synchronized void releaseLettuce() {
+    if (--lettuceRefs == 0) {
+      lettuce.shutdown();
+      lettuce = null;
+    }
+  }
+
+  private static synchronized CountDownLatch allConnectedLatch(int threads) {
+    if (allConnected == null) {
+      allConnected = new CountDownLatch(threads);
+    }
+    return allConnected;
+  }
+
+  @Override
+  public void drain() throws DBException {
+    if (async) {
+      drainOutstanding();
+    }
+  }
+
+  /** Waits (bounded by redis.async.drainTimeoutMs) for this thread's in-flight requests so they are measured. */
+  private void drainOutstanding() throws DBException {
+    long deadline = System.currentTimeMillis() + drainTimeoutMs;
+    try {
+      synchronized (drainLock) {
+        long left = deadline - System.currentTimeMillis();
+        while (outstanding.get() > 0 && left > 0) {
+          drainLock.wait(left);
+          left = deadline - System.currentTimeMillis();
+        }
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new DBException("Interrupted while draining.");
+    }
+    long remaining = outstanding.get();
+    if (remaining > 0) {
+      System.err.println(remaining + " async requests still outstanding after " + drainTimeoutMs
+          + " ms; they are not measured.");
+    }
+  }
+
   public void cleanup() throws DBException {
+    if (async) {
+      drainOutstanding();
+      connection.close();
+      releaseLettuce();
+      return;
+    }
     try {
       ((Closeable) jedis).close();
     } catch (IOException e) {
@@ -120,6 +271,16 @@ public class RedisClient extends DB {
   @Override
   public Status read(String table, String key, Set<String> fields,
       Map<String, ByteIterator> result) {
+    if (async) {
+      Pending p = new Pending("READ");
+      if (fields == null) {
+        // The caller's result map is not filled in: the call has returned before the data arrives.
+        complete(p, commands.hgetall(key), m -> m.isEmpty() ? Status.ERROR : Status.OK);
+      } else {
+        complete(p, commands.hmget(key, fields.toArray(new String[fields.size()])), RedisClient::hmgetStatus);
+      }
+      return Status.PENDING;
+    }
     if (fields == null) {
       StringByteIterator.putAllAsByteIterators(result, jedis.hgetAll(key));
     } else {
@@ -142,6 +303,16 @@ public class RedisClient extends DB {
   @Override
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
+    if (async) {
+      Pending p = new Pending("INSERT");
+      complete(p, commands.hmset(key, StringByteIterator.getStringMap(values)).thenCompose(r -> {
+          if (!"OK".equals(r)) {
+            return java.util.concurrent.CompletableFuture.completedFuture(Status.ERROR);
+          }
+          return commands.zadd(INDEX_KEY, hash(key), key).thenApply(n -> Status.OK);
+        }), s -> s);
+      return Status.PENDING;
+    }
     if (jedis.hmset(key, StringByteIterator.getStringMap(values))
         .equals("OK")) {
       jedis.zadd(INDEX_KEY, hash(key), key);
@@ -152,6 +323,12 @@ public class RedisClient extends DB {
 
   @Override
   public Status delete(String table, String key) {
+    if (async) {
+      Pending p = new Pending("DELETE");
+      complete(p, commands.del(key).thenCompose(d -> commands.zrem(INDEX_KEY, key)
+          .thenApply(z -> d == 0 && z == 0 ? Status.ERROR : Status.OK)), s -> s);
+      return Status.PENDING;
+    }
     return jedis.del(key) == 0 && jedis.zrem(INDEX_KEY, key) == 0 ? Status.ERROR
         : Status.OK;
   }
@@ -159,6 +336,12 @@ public class RedisClient extends DB {
   @Override
   public Status update(String table, String key,
       Map<String, ByteIterator> values) {
+    if (async) {
+      Pending p = new Pending("UPDATE");
+      complete(p, commands.hmset(key, StringByteIterator.getStringMap(values)),
+          r -> "OK".equals(r) ? Status.OK : Status.ERROR);
+      return Status.PENDING;
+    }
     return jedis.hmset(key, StringByteIterator.getStringMap(values))
         .equals("OK") ? Status.OK : Status.ERROR;
   }
@@ -179,4 +362,59 @@ public class RedisClient extends DB {
     return Status.OK;
   }
 
+
+  /** HMGET in the synchronous read: an error if no field came back. */
+  private static Status hmgetStatus(List<KeyValue<String, String>> values) {
+    for (KeyValue<String, String> v : values) {
+      if (v.hasValue()) {
+        return Status.OK;
+      }
+    }
+    return Status.ERROR;
+  }
+
+  private <T> void complete(Pending p, CompletionStage<T> f, java.util.function.Function<T, Status> status) {
+    f.whenComplete((r, e) -> {
+        if (e != null) {
+          long n = ASYNC_ERRORS.incrementAndGet();
+          if (n <= ERROR_LOG_FIRST || n % ERROR_LOG_EVERY == 0) {
+            System.err.println("Async error #" + n + " on " + p.op + ": " + e);
+          }
+          p.complete(Status.ERROR);
+        } else {
+          p.complete(status.apply(r));
+        }
+      });
+  }
+
+  /** An in-flight async request; created on the issuing client thread, which holds the intended start time. */
+  private final class Pending {
+    private final String op;
+    private final long intendedStartNs;
+    private final long startNs;
+
+    Pending(String op) {
+      this.op = op;
+      this.intendedStartNs = measurements.getIntendedStartTimeNs();
+      this.startNs = System.nanoTime();
+      outstanding.incrementAndGet();
+    }
+
+    /** Mirrors DBWrapper's measurement: failures are recorded under OP-FAILED. */
+    void complete(Status status) {
+      long endNs = System.nanoTime();
+      String name = op;
+      if (!status.isOk()) {
+        name = op + "-FAILED";
+      }
+      measurements.measure(name, (int) ((endNs - startNs) / 1000));
+      measurements.measureIntended(name, (int) ((endNs - intendedStartNs) / 1000));
+      measurements.reportStatus(op, status);
+      if (outstanding.decrementAndGet() == 0) {
+        synchronized (drainLock) {
+          drainLock.notifyAll();
+        }
+      }
+    }
+  }
 }
